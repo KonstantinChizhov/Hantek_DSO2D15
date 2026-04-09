@@ -13,7 +13,7 @@ Key SCPI commands used (from the DSO2000 Series SCPI Programmers Manual):
   - :DDS:FREQ <Hz>                                 — set wave-generator frequency
   - :DDS:AMP <Vpp>                                 — set wave-generator amplitude
   - :DDS:OFFSet <V>                                — set wave-generator DC offset
-  - :DDS:OUTPut <ON|OFF>                           — enable/disable wave generator
+  - :DDS:SWITch <ON|OFF>                           — enable/disable wave generator
   - :CHANnel<N>:SCALe <V/div>                      — set channel vertical scale
   - :CHANnel<N>:OFFSet <V>                         — set channel vertical offset
   - :CHANnel<N>:COUPling <AC|DC>                   — set channel coupling
@@ -192,7 +192,11 @@ class DSO2D15:
 
     def enable_wave_output(self, enabled: bool = True) -> None:
         """Turn the wave generator output ON or OFF."""
-        self._write(f":DDS:OUTPut {'ON' if enabled else 'OFF'}")
+        self._write(f":DDS:SWITch {'ON' if enabled else 'OFF'}")
+
+    def get_wave_output_state(self) -> str:
+        """Query the current wave generator output state (ON/OFF)."""
+        return self._query(":DDS:SWITch?")
 
     def get_wave_type(self) -> str:
         """Query the current wave generator type."""
@@ -258,24 +262,41 @@ class DSO2D15:
         """Arm a single-shot acquisition."""
         self._write(":SINGle")
 
-    def wait_acquisition_done(self, timeout_s: float = 10.0, poll_interval: float = 0.05) -> bool:
+    def wait_acquisition_done(self, timeout_s: float = 10.0) -> bool:
         """
-        Poll the scope until a single-shot acquisition is complete.
+        Wait until the current acquisition is complete.
 
-        Returns True if the scope reports it has finished acquiring,
-        False if the timeout elapsed.
+        Uses ``*OPC?`` (Operation Complete) for reliable synchronization.
+        ``*OPC?`` blocks on the instrument side until all pending commands
+        finish, then returns ``"1"``.  If the query times out, falls back
+        to polling ``:TRIGger:STATus?``.
+
+        Returns True if acquisition is confirmed done, False on timeout.
         """
+        # Primary method: *OPC? is blocking on the instrument side
+        try:
+            old_timeout = self._inst.timeout
+            self._inst.timeout = int(timeout_s * 1000)
+            result = self._query("*OPC?").strip()
+            self._inst.timeout = old_timeout
+            return result == "1"
+        except Exception:
+            try:
+                self._inst.timeout = old_timeout
+            except Exception:
+                pass
+
+        # Fallback: poll trigger status
         deadline = time.time() + timeout_s
         while time.time() < deadline:
             try:
                 status = self._query(":TRIGger:STATus?").upper()
-                # ":TRIGger:STATus?" returns AUTO, NORM, SING, STOP, or READY
-                # READY means acquisition is done
                 if status in ("READY", "STOP"):
                     return True
             except Exception:
                 pass
-            time.sleep(poll_interval)
+            time.sleep(0.05)
+
         return False
 
     def set_sample_rate(self, sample_rate: int) -> None:

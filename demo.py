@@ -2,6 +2,8 @@
 Demo: Hantek DSO2D15 — enable wave generator, set a sine wave, capture a
 sample buffer, and plot it with matplotlib.
 
+Uses the correct `:DDS:SWITch` command to enable/disable the DDS output.
+
 Usage
 -----
     python demo.py
@@ -19,77 +21,64 @@ from dso2d15 import DSO2D15, WaveType, Coupling
 
 
 # ---------------------------------------------------------------------------
-# Configuration (tweak these for your experiment)
+# Configuration
 # ---------------------------------------------------------------------------
-RESOURCE = None          # None → auto-discover, or e.g. "USB0::1183::..."
-CHANNEL = 1              # Acquisition channel (1 or 2)
+RESOURCE = None          # None → auto-discover
+CHANNEL = 1
 
 WAVE_TYPE = WaveType.SINE
-WAVE_FREQ_HZ = 1000.0    # 1 kHz sine from the built-in generator
-WAVE_AMP_VPP = 2.0       # 2 Vpp
+WAVE_FREQ_HZ = 1000.0
+WAVE_AMP_VPP = 2.0
 
-V_DIV = 0.5              # Vertical scale: 0.5 V/div
-TIME_DIV_S = 0.0005      # Horizontal scale: 500 µs/div
-TRIGGER_LEVEL_V = 0.0    # Trigger at 0 V
+V_DIV = 0.5
+TIME_DIV_S = 0.0005
+TRIGGER_LEVEL_V = 0.0
 
 
 def main() -> None:
-    if RESOURCE:
-        scope = DSO2D15(resource=RESOURCE)
-        scope.connect()
-    else:
-        scope = DSO2D15.auto_discover()
+    scope = DSO2D15.auto_discover() if not RESOURCE else DSO2D15(resource=RESOURCE)
 
     try:
-        # -- 1. Basic oscilloscope setup -----------------------------------
-        print("Configuring channel and timebase …")
-        scope.setup_basic(
-            channel=CHANNEL,
-            v_div=V_DIV,
-            s_div=TIME_DIV_S,
-            coupling=Coupling.DC,
-            trigger_level=TRIGGER_LEVEL_V,
-        )
+        # -- 1. Oscilloscope setup -----------------------------------------
+        print("Configuring scope …")
+        scope.enable_channel(CHANNEL)
+        scope.set_channel_scale(CHANNEL, V_DIV)
+        scope.set_channel_coupling(CHANNEL, Coupling.DC)
+        scope.set_timebase_scale(TIME_DIV_S)
+        scope.set_trigger_edge_source(CHANNEL)
+        scope.set_trigger_level(TRIGGER_LEVEL_V)
 
-        # -- 2. Wave generator setup ---------------------------------------
-        print(
-            f"Setting wave generator: {WAVE_TYPE.value} @ {WAVE_FREQ_HZ} Hz, "
-            f"{WAVE_AMP_VPP} Vpp …"
-        )
+        # -- 2. DDS setup --------------------------------------------------
+        print(f"Setting wave gen: {WAVE_TYPE.value} @ {WAVE_FREQ_HZ} Hz, {WAVE_AMP_VPP} Vpp …")
+        scope.enable_wave_output(False)
+        time.sleep(0.3)
         scope.set_wave_type(WAVE_TYPE)
         scope.set_wave_frequency(WAVE_FREQ_HZ)
         scope.set_wave_amplitude(WAVE_AMP_VPP)
+        time.sleep(0.3)
         scope.enable_wave_output(True)
+        time.sleep(1.0)  # Let DDS hardware stabilize
 
         # -- 3. Acquire ----------------------------------------------------
-        print("Starting single-shot acquisition …")
-        scope.stop()          # Ensure clean state
-        time.sleep(0.2)       # Let the scope settle
-        scope.single()
+        print("Acquiring …")
+        scope.run()
+        time.sleep(1.5)   # Let scope settle in continuous mode
+        scope.stop()
 
-        # Wait until the scope has finished acquiring
-        if not scope.wait_acquisition_done(timeout_s=10.0):
-            print("WARNING: Acquisition timed out. Reading whatever is in the buffer.")
-        else:
-            print("Acquisition complete.")
+        # -- 4. Read & plot ------------------------------------------------
+        print("Reading waveform …")
+        voltages, _, _ = scope.read_waveform(channel=CHANNEL)
+        print(f"  {len(voltages)} samples, {min(voltages):.3f} V to {max(voltages):.3f} V")
 
-        # -- 4. Read waveform data -----------------------------------------
-        print("Reading waveform buffer …")
-        voltages, y_incr, y_origin = scope.read_waveform(channel=CHANNEL)
-
-        # Build the time axis from the timebase setting.
         num_samples = len(voltages)
-        total_time = TIME_DIV_S * 10  # 10 horizontal divisions
+        total_time = TIME_DIV_S * 10
         time_axis = np.linspace(0, total_time, num_samples)
 
-        # -- 5. Plot -------------------------------------------------------
-        print("Plotting …")
         plt.figure(figsize=(10, 5))
         plt.plot(time_axis * 1e3, voltages, linewidth=0.8, color="cyan")
         plt.title(
             f"DSO2D15 — CH{CHANNEL}  |  "
-            f"{WAVE_TYPE.value} {WAVE_FREQ_HZ} Hz, {WAVE_AMP_VPP} Vpp  |  "
-            f"{V_DIV} V/div, {TIME_DIV_S * 1e6:.0f} µs/div"
+            f"{WAVE_TYPE.value} {WAVE_FREQ_HZ} Hz, {WAVE_AMP_VPP} Vpp"
         )
         plt.xlabel("Time (ms)")
         plt.ylabel("Voltage (V)")
@@ -98,9 +87,9 @@ def main() -> None:
         plt.tight_layout()
         plt.show()
 
-        # -- 6. Cleanup (wave gen off) -------------------------------------
+        # -- 5. Cleanup ----------------------------------------------------
         scope.enable_wave_output(False)
-        print("Done. Wave generator output disabled.")
+        print("Done. Wave gen disabled.")
     finally:
         scope.close()
 
