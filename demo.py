@@ -25,6 +25,7 @@ from dso2d15 import DSO2D15, WaveType, Coupling
 # ---------------------------------------------------------------------------
 RESOURCE = None          # None → auto-discover
 CHANNEL = 1
+DISABLE_CH2 = True
 
 WAVE_TYPE = WaveType.SINE
 WAVE_FREQ_HZ = 1000.0
@@ -33,6 +34,7 @@ WAVE_AMP_VPP = 2.0
 V_DIV = 0.5
 TIME_DIV_S = 0.0005
 TRIGGER_LEVEL_V = 0.0
+ACQ_POINTS = 4000
 
 
 def main() -> None:
@@ -42,9 +44,12 @@ def main() -> None:
         # -- 1. Oscilloscope setup -----------------------------------------
         print("Configuring scope …")
         scope.enable_channel(CHANNEL)
+        if DISABLE_CH2:
+            scope.enable_channel(2, False)
         scope.set_channel_scale(CHANNEL, V_DIV)
         scope.set_channel_coupling(CHANNEL, Coupling.DC)
         scope.set_timebase_scale(TIME_DIV_S)
+        scope.set_acquisition_points(ACQ_POINTS)
         scope.set_trigger_edge_source(CHANNEL)
         scope.set_trigger_level(TRIGGER_LEVEL_V)
 
@@ -60,18 +65,20 @@ def main() -> None:
         time.sleep(1.0)  # Let DDS hardware stabilize
 
         # -- 3. Acquire ----------------------------------------------------
-        print("Acquiring …")
-        scope.run()
-        time.sleep(1.5)   # Let scope settle in continuous mode
-        scope.stop()
+        print("Acquiring one fresh single-shot record …")
 
         # -- 4. Read & plot ------------------------------------------------
         print("Reading waveform …")
-        voltages, _, _ = scope.read_waveform(channel=CHANNEL)
+        voltages, _, _ = scope.capture_single_waveform(channel=CHANNEL, timeout_s=2.0)
         print(f"  {len(voltages)} samples, {min(voltages):.3f} V to {max(voltages):.3f} V")
 
         num_samples = len(voltages)
-        total_time = TIME_DIV_S * 10
+        try:
+            sample_rate = scope.get_acquisition_sample_rate()
+            total_time = num_samples / sample_rate if sample_rate > 0 else (TIME_DIV_S * 10)
+            print(f"  Sample rate: {sample_rate:.3e} Sa/s, window: {total_time*1e3:.3f} ms")
+        except Exception:
+            total_time = TIME_DIV_S * 10
         time_axis = np.linspace(0, total_time, num_samples)
 
         plt.figure(figsize=(10, 5))

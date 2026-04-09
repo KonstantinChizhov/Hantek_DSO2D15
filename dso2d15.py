@@ -264,34 +264,16 @@ class DSO2D15:
 
     def wait_acquisition_done(self, timeout_s: float = 10.0) -> bool:
         """
-        Wait until the current acquisition is complete.
+        Wait until a trigger event is reported.
 
-        Uses ``*OPC?`` (Operation Complete) for reliable synchronization.
-        ``*OPC?`` blocks on the instrument side until all pending commands
-        finish, then returns ``"1"``.  If the query times out, falls back
-        to polling ``:TRIGger:STATus?``.
-
-        Returns True if acquisition is confirmed done, False on timeout.
+        Per the DSO2000 SCPI manual, ``:TRIGger:STATus?`` returns ``TRIGed`` or
+        ``NOTRIG``. For single-shot capture we treat ``TRIGed`` as completion.
         """
-        # Primary method: *OPC? is blocking on the instrument side
-        try:
-            old_timeout = self._inst.timeout
-            self._inst.timeout = int(timeout_s * 1000)
-            result = self._query("*OPC?").strip()
-            self._inst.timeout = old_timeout
-            return result == "1"
-        except Exception:
-            try:
-                self._inst.timeout = old_timeout
-            except Exception:
-                pass
-
-        # Fallback: poll trigger status
         deadline = time.time() + timeout_s
         while time.time() < deadline:
             try:
                 status = self._query(":TRIGger:STATus?").upper()
-                if status in ("READY", "STOP"):
+                if "TRIG" in status and "NOTRIG" not in status:
                     return True
             except Exception:
                 pass
@@ -303,8 +285,108 @@ class DSO2D15:
         """Set the sample rate in Sa/s (if supported by firmware)."""
         self._write(f":ACQuire:SAMPling {sample_rate}")
 
+    def set_acquisition_points(self, points: int) -> None:
+        """Set acquisition memory depth (e.g., 4000, 40000, 400000...)."""
+        self._write(f":ACQuire:POINts {int(points)}")
+
+    def get_acquisition_points(self) -> int:
+        """Query acquisition memory depth."""
+        return int(float(self._query(":ACQuire:POINts?")))
+
+    def get_acquisition_sample_rate(self) -> float:
+        """Query current acquisition sampling rate in Sa/s."""
+        return float(self._query(":ACQuire:SRATe?"))
+
+    def set_acquisition_state(self, running: bool) -> None:
+        """Explicitly set acquisition state without relying on front-panel toggle logic."""
+        self._write(f":ACQuire:STATE {'ON' if running else 'OFF'}")
+
+    def clear_buffer(self) -> None:
+        """Flush any pending data in the VISA input buffer."""
+        if self._inst is None:
+            return
+        try:
+            old_timeout = self._inst.timeout
+            self._inst.timeout = 100
+            while True:
+                self._inst.read_raw()
+        except Exception:
+            try:
+                self._inst.timeout = old_timeout
+            except Exception:
+                pass
+
+    def capture_single_waveform(
+        self,
+        channel: int = 1,
+        timeout_s: float = 2.0,
+        retries: int = 2,
+        min_samples: int = 1000,
+        read_retries_per_capture: int = 2,
+        read_timeout_ms: int = 5000,
+    ) -> Tuple[List[float], float, float]:
+        """
+        Capture and read one fresh waveform record.
+
+        This sequence avoids stale records by forcing acquisition into a known
+        state, arming a single-shot capture, waiting for completion, and only
+        then reading the waveform data.
+        """
+        assert self._inst is not None, "Not connected."
+
+        # Drain any pending reply fragments before starting a new capture.
+        self.clear_buffer()
+
+        last_error: Optional[Exception] = None
+        for attempt in range(1, max(1, retries) + 1):
+            # SCPI-manual-compliant single shot flow:
+            #   1) select single trigger sweep
+            #   2) force one trigger to ensure capture from STOP state
+            self.set_trigger_sweep("SINGle")
+            time.sleep(0.03)
+            self.force_trigger()
+
+            done = self.wait_acquisition_done(timeout_s=timeout_s)
+            if not done:
+                warnings.warn(
+                    f"Single acquisition did not complete within {timeout_s:.2f}s; "
+                    "reading last available waveform record.",
+                    RuntimeWarning,
+                )
+
+            for read_try in range(1, max(1, read_retries_per_capture) + 1):
+                try:
+                    voltages, y_inc, y_org = self.read_waveform(
+                        channel=channel,
+                        read_timeout_ms=read_timeout_ms,
+                    )
+                    if len(voltages) >= max(1, min_samples):
+                        return voltages, y_inc, y_org
+                    raise ValueError(
+                        f"Waveform payload too short: {len(voltages)} samples "
+                        f"(expected >= {max(1, min_samples)})."
+                    )
+                except Exception as exc:
+                    last_error = exc
+                    if read_try < max(1, read_retries_per_capture):
+                        # Re-read the same frozen capture before forcing a new one.
+                        time.sleep(0.05)
+                        continue
+
+            if attempt < max(1, retries):
+                # Start a fresh acquisition cycle after read retries are exhausted.
+                self.clear_buffer()
+                time.sleep(0.05)
+                continue
+            break
+
+        raise RuntimeError(
+            f"Failed to capture non-empty waveform after {max(1, retries)} acquisition "
+            f"attempt(s) and {max(1, read_retries_per_capture)} read retry(ies) each."
+        ) from last_error
+
     def read_waveform(
-        self, channel: int = 1
+        self, channel: int = 1, read_timeout_ms: int = 5000
     ) -> Tuple[List[float], float, float]:
         """
         Read the captured waveform buffer from the specified channel.
@@ -319,38 +401,109 @@ class DSO2D15:
             Reference voltage offset.
         """
         assert self._inst is not None, "Not connected."
+        # Parse IEEE 488.2 definite-length block exactly:
+        #   #<n><n-digit-byte-count><payload>
+        def _read_ieee_block_payload() -> bytes:
+            old_read_term = self._inst.read_termination
+            old_timeout = self._inst.timeout
+            try:
+                # IMPORTANT: disable termination for binary block reads.
+                self._inst.read_termination = None
+                self._inst.timeout = int(max(500, read_timeout_ms))
 
-        # Select the waveform source channel
-        self._inst.write(f":WAVeform:SOURce CHANnel{channel}")
+                # Select the waveform source and request one data block.
+                self._inst.write(f":WAVeform:SOURce CHANnel{channel}")
+                self._inst.write(":WAVeform:DATA:ALL?")
 
-        # Send the query command
-        self._inst.write(":WAVeform:DATA:ALL?")
+                # Read one raw USBTMC transfer and parse IEEE block from it.
+                raw = self._inst.read_raw()
+                if len(raw) < 3 or raw[0:1] != b"#":
+                    raise ValueError(f"Unexpected waveform prefix: {raw[:32]!r}")
 
-        # Read raw bytes (IEEE 488.2 block with binary payload)
-        raw_bytes = self._inst.read_raw()
+                n_digits = int(chr(raw[1]))
+                if n_digits <= 0 or n_digits > 9:
+                    raise ValueError(f"Invalid IEEE block digit count: {n_digits}")
 
-        if not raw_bytes.startswith(b"#"):
-            raise ValueError(
-                f"Unexpected waveform header: {raw_bytes[:30]!r}"
-            )
+                if len(raw) < 2 + n_digits:
+                    raise ValueError("Incomplete IEEE header in raw transfer.")
 
-        # Parse IEEE 488.2 definite length block
-        num_digits = int(chr(raw_bytes[1]))
-        # The declared count includes the IEEE header itself, so subtract it
-        ieee_header_len = 2 + num_digits
-        declared_total = int(raw_bytes[2 : 2 + num_digits])
-        expected_payload = declared_total - ieee_header_len
+                payload_len = int(raw[2 : 2 + n_digits].decode("ascii"))
+                # Guard against corrupted header values that would stall reads.
+                if payload_len < 0 or payload_len > 20_000_000:
+                    raise ValueError(f"Unreasonable IEEE payload length: {payload_len}")
 
-        # Extract payload (may be slightly short due to scope firmware quirks)
-        actual_payload = raw_bytes[ieee_header_len:]
+                header_len = 2 + n_digits
+                payload_have = len(raw) - header_len
 
-        # The DSO2000 payload starts with a 19-byte ASCII metadata block,
-        # then binary 8-bit ADC samples. Example ASCII header:
-        #   "0000040990000000099"  (sample_count + reserved fields)
-        ASCII_HEADER_LEN = 19
-        binary_data = actual_payload[ASCII_HEADER_LEN:]
+                # Firmware quirk: some DSO2D15 responses encode byte-count as
+                # "header + payload" instead of payload only.
+                if payload_have >= payload_len:
+                    payload = raw[header_len : header_len + payload_len]
+                elif payload_have == (payload_len - header_len):
+                    payload = raw[header_len:]
+                else:
+                    raise ValueError(
+                        f"Short IEEE payload read: got {payload_have} of {payload_len} bytes."
+                    )
+
+                return payload
+            finally:
+                self._inst.read_termination = old_read_term
+                self._inst.timeout = old_timeout
+
+        def _parse_packet(payload: bytes) -> Tuple[int, int, bytes]:
+            """
+            Parse one DATA:ALL payload block.
+
+            Manual structure (after IEEE #9 header is removed):
+              [0:9]   total waveform byte count
+              [9:18]  uploaded bytes in this packet
+              [18:]   waveform bytes (or metadata when uploaded == 0)
+            """
+            if len(payload) < 18 or (not payload[:18].isdigit()):
+                raise ValueError(f"Unexpected packet header: {payload[:32]!r}")
+
+            total_len = int(payload[0:9])
+            uploaded_len = int(payload[9:18])
+
+            if uploaded_len <= 0:
+                # Metadata-only packet: keep polling for data packets.
+                return total_len, 0, b""
+
+            data_start = 18
+            # On this firmware, uploaded_len does not always equal actual chunk bytes.
+            # Use everything after the 18-byte ASCII header as waveform bytes.
+            chunk = payload[data_start:]
+            if not chunk:
+                return total_len, uploaded_len, b""
+            return total_len, uploaded_len, chunk
+
+        # Read a few packets and keep the largest valid data chunk.
+        # Empirically, this scope alternates metadata-only and data packets.
+        best_chunk = b""
+        expected_total = 0
+        max_packet_reads = 6
+        for _ in range(max_packet_reads):
+            payload = _read_ieee_block_payload()
+            total_len, _, chunk = _parse_packet(payload)
+            if total_len > 0:
+                expected_total = total_len
+            if len(chunk) > len(best_chunk):
+                best_chunk = chunk
+            # Data packet is usually full enough once >= ~4000 bytes.
+            if len(best_chunk) >= 3900:
+                break
+
+        if not best_chunk:
+            raise ValueError("No waveform data chunk received.")
+
+        binary_data = bytearray(best_chunk)
+        if expected_total > 0 and len(binary_data) > expected_total:
+            binary_data = binary_data[:expected_total]
 
         num_samples = len(binary_data)
+        if num_samples == 0:
+            raise ValueError("Empty waveform payload returned by instrument.")
         raw_values = struct.unpack(f"{num_samples}B", binary_data)
 
         # Compute scaling from channel settings
@@ -405,5 +558,33 @@ class DSO2D15:
         self.set_trigger_mode(trigger_mode)
 
     def set_trigger_mode(self, mode: str) -> None:
-        """Set trigger mode: AUTO, NORMAL, or SINGLE."""
+        """
+        Backward-compatible alias.
+
+        Historically this method was (incorrectly) used for AUTO/NORMAL/SINGLE.
+        Route those values to :TRIGger:SWEep, otherwise treat as trigger type.
+        """
+        mode_u = mode.upper()
+        if mode_u in {"AUTO", "NORM", "NORMAL", "SING", "SINGLE"}:
+            self.set_trigger_sweep(mode_u)
+            return
         self._write(f":TRIGger:MODE {mode}")
+
+    def set_trigger_type(self, trig_type: str) -> None:
+        """Set trigger type (EDGE, PULSe, TV, SLOPe, TIMeout, WINdow, ...)."""
+        self._write(f":TRIGger:MODE {trig_type}")
+
+    def set_trigger_sweep(self, sweep: str) -> None:
+        """Set trigger sweep mode (AUTO, NORMal, SINGle)."""
+        sweep_map = {
+            "AUTO": "AUTO",
+            "NORM": "NORMal",
+            "NORMAL": "NORMal",
+            "SING": "SINGle",
+            "SINGLE": "SINGle",
+        }
+        self._write(f":TRIGger:SWEep {sweep_map.get(sweep.upper(), sweep)}")
+
+    def force_trigger(self) -> None:
+        """Force one trigger event regardless of trigger condition."""
+        self._write(":TRIGger:FORCe")

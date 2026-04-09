@@ -25,6 +25,7 @@ from dso2d15 import DSO2D15, WaveType, Coupling
 # ---------------------------------------------------------------------------
 RESOURCE = None          # None -> auto-discover
 CHANNEL = 1
+DISABLE_CH2 = True
 
 FREQ_START_HZ = 40_000
 FREQ_STOP_HZ = 200_000
@@ -36,7 +37,8 @@ DDS_OFFSET_V = 0.0
 V_DIV = 0.5              # Scope vertical scale
 TIME_DIV_S = 50e-6       # Timebase — enough cycles at each frequency
 TRIGGER_LEVEL_V = 0.0
-SETTLE_S = 0.5           # Wait after frequency change before capture
+SETTLE_S = 0.1           # Wait after frequency change before capture
+ACQ_POINTS = 4000        # Fixed depth to avoid fragmented packet artifacts
 
 
 def measure_amplitude(voltages: list[float]) -> float:
@@ -73,9 +75,13 @@ def main() -> None:
         # -- Scope setup ---------------------------------------------------
         print("Configuring oscilloscope …")
         scope.enable_channel(CHANNEL)
+        if DISABLE_CH2:
+            scope.enable_channel(2, False)
         scope.set_channel_scale(CHANNEL, V_DIV)
         scope.set_channel_coupling(CHANNEL, Coupling.DC)
+        scope.set_channel_offset(CHANNEL, 0.0)
         scope.set_timebase_scale(TIME_DIV_S)
+        scope.set_acquisition_points(ACQ_POINTS)
         scope.set_trigger_edge_source(CHANNEL)
         scope.set_trigger_level(TRIGGER_LEVEL_V)
         scope.set_trigger_mode("AUTO")
@@ -109,18 +115,11 @@ def main() -> None:
             scope.set_wave_frequency(freq)
             time.sleep(SETTLE_S)
 
-            # Force a fresh single-shot acquisition
-            scope._write(":TRIGger:MODE AUTO")
-            scope._write(":SINGle")
-
-            # Wait for acquisition to complete
-            scope.wait_acquisition_done(timeout_s=2.0)
-
-            # Small delay to ensure buffer is ready
-            time.sleep(0.1)
-
-            # Read waveform
-            voltages, _, _ = scope.read_waveform(channel=CHANNEL)
+            # Capture one fresh single-shot record per frequency point.
+            voltages, _, _ = scope.capture_single_waveform(
+                channel=CHANNEL,
+                timeout_s=max(1.0, SETTLE_S + 0.5),
+            )
 
             # Measure
             vpp = measure_amplitude(voltages)
