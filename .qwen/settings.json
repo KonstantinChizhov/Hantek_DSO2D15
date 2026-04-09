@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "WebFetch(www.hantek.com)",
+      "WebFetch(github.com)",
+      "WebFetch(www.manualslib.com)",
+      "Bash(python *)"
+    ]
+  },
+  "$version": 3
+}
