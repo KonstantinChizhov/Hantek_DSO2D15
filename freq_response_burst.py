@@ -68,7 +68,7 @@ def measure_window1(
     x_origin_s: float,
     burst_cycles: int,
     excitation_freq_hz: float,
-) -> tuple[float, np.ndarray, int, int]:
+) -> tuple[float, float, np.ndarray, int, int]:
     """Measure RMS in a single time window after the burst excitation.
 
     Strategy (deterministic, frequency-anchored):
@@ -93,8 +93,10 @@ def measure_window1(
 
     Returns
     -------
-    rms : float
-        RMS amplitude in the measurement window.
+    rms_response : float
+        RMS amplitude of the response (after the burst).
+    rms_excitation : float
+        RMS amplitude of the excitation burst itself.
     window_data : np.ndarray
         Raw voltage samples from the measurement window (for FFT/spectrogram).
     win_start_idx : int
@@ -125,7 +127,7 @@ def measure_window1(
     if peak_val < 1e-6:
         # No signal detected
         win_len = max(10, int(WINDOW1_DUR_US / dt_us))
-        return 0.0, np.zeros(win_len), n // 2, n // 2 + win_len
+        return 0.0, 0.0, np.zeros(win_len), n // 2, n // 2 + win_len
 
     # ---- Step 3: Calculate burst timing from known frequency ---------------
     # Period is known exactly from the DDS frequency
@@ -143,10 +145,17 @@ def measure_window1(
     burst_end_us = burst_start_us + burst_duration_us
 
     burst_end_idx = int(burst_end_us / dt_us)
+    burst_start_idx = int(burst_start_us / dt_us)
+
+    # Calculate excitation RMS over the exact burst window
+    burst_start_idx = max(0, burst_start_idx)
+    burst_end_idx = min(n, burst_end_idx)
+    excitation_data = arr[burst_start_idx:burst_end_idx]
+    rms_excitation = calc_rms(excitation_data)
 
     # ---- Step 4: Place measurement window after burst + gap ----------------
-    # Gap of ~1 period ensures we're past any ringing/settling from the burst
-    gap_us = max(5.0, period_us * 0.8)
+    # Gap = 1 full period after burst end, so the window starts on the next peak.
+    gap_us = period_us * 1.8  # ~1 period past burst end + half period to next peak
     window_start_us = burst_end_us + gap_us
     window_start_idx = int(window_start_us / dt_us)
 
@@ -163,7 +172,7 @@ def measure_window1(
     window_data = arr[window_start_idx:win_end_idx]
     rms = calc_rms(window_data)
 
-    return rms, window_data, window_start_idx, win_end_idx
+    return rms, rms_excitation, window_data, window_start_idx, win_end_idx
 
 
 _debug_printed = False
@@ -224,6 +233,7 @@ def main() -> None:
         print(f"RMS Window: {WINDOW1_DUR_US} µs starting after 2 zero crossings post-burst\n")
 
         rms_values: list[float] = []
+        excitation_values: list[float] = []
         response_spectra: list[tuple[float, np.ndarray, np.ndarray]] = []  # (exc_freq, fft_freqs, magnitude)
         # Store: (freq, voltages, sample_rate, win_start_idx, win_end_idx)
         all_buffers: list[tuple[float, np.ndarray, float, int, int]] = []
@@ -263,11 +273,12 @@ def main() -> None:
             effective_sr = 1.0 / x_increment_s if x_increment_s > 0 else sample_rate
 
             # Measure RMS and extract response window data
-            rms, window_data, win_start, win_end = measure_window1(
+            rms, rms_exc, window_data, win_start, win_end = measure_window1(
                 voltages, effective_sr, x_origin_s, BURST_CYCLES,
                 excitation_freq_hz=freq,
             )
             rms_values.append(rms)
+            excitation_values.append(rms_exc)
 
             # Store full buffer for waveform viewer with window indices
             all_buffers.append((freq, np.array(voltages), effective_sr, win_start, win_end))
@@ -301,6 +312,7 @@ def main() -> None:
 
         # -- Analysis ------------------------------------------------------
         rms_arr = np.array(rms_values)
+        exc_arr = np.array(excitation_values)
         freqs_arr = np.array(freqs) / 1000  # kHz
 
         max_idx = np.argmax(rms_arr)
@@ -364,11 +376,14 @@ def main() -> None:
         # Top: RMS amplitude + dominant frequencies on secondary axis
         (rms_line,) = ax1.plot(freqs_arr, rms_arr, linewidth=1.2, color="cyan",
                                marker=".", markersize=3, label="RMS Response")
+        (exc_line,) = ax1.plot(freqs_arr, exc_arr, linewidth=1.2, color="magenta",
+                               marker=".", markersize=3, label="RMS Excitation")
         rms_peak_vline = ax1.axvline(freqs_arr[max_idx], color="gray", linewidth=0.5,
                                      linestyle="--")
         # Slider indicator on RMS plot
+        y_max = max(np.max(rms_arr), np.max(exc_arr))
         (slider_vline,) = ax1.plot([freqs_arr[0], freqs_arr[0]],
-                                   [0, np.max(rms_arr) * 1.1],
+                                   [0, y_max * 1.1],
                                    color="red", linewidth=1.5, linestyle="-", alpha=0.7)
 
         (dom1_line,) = ax1r.plot(freqs_arr, dom_freq1_khz, linewidth=1.0,
