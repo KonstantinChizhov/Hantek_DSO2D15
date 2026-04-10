@@ -67,15 +67,16 @@ def measure_window1(
     sample_rate: float,
     x_origin_s: float,
     burst_cycles: int,
-    skip_zero_crossings: int = 2,
-) -> tuple[float, np.ndarray]:
+    excitation_freq_hz: float,
+) -> tuple[float, np.ndarray, int, int]:
     """Measure RMS in a single time window after the burst excitation.
 
-    Strategy:
-      1. Find where the burst starts (first significant amplitude rise).
-      2. Calculate burst end = burst_start + burst_cycles * period.
-      3. Skip N positive-going zero crossings after burst end.
-      4. Place the measurement window after those crossings.
+    Strategy (deterministic, frequency-anchored):
+      1. Find burst PEAK index (stable anchor — argmax is deterministic).
+      2. Calculate exact burst duration from known frequency: duration = cycles / freq.
+      3. Find burst start = peak - (burst_cycles/2) * period (peak ≈ center of burst).
+      4. burst_end = burst_start + burst_duration.
+      5. Place measurement window at burst_end + gap.
 
     Parameters
     ----------
@@ -87,9 +88,8 @@ def measure_window1(
         Time offset of sample[0] relative to trigger (from :WAVeform:XORigin?).
     burst_cycles : int
         Number of cycles in the excitation burst.
-    skip_zero_crossings : int
-        Number of positive-going zero crossings to skip after burst end
-        before starting the measurement window.
+    excitation_freq_hz : float
+        The known DDS excitation frequency in Hz (set before capture).
 
     Returns
     -------
@@ -97,92 +97,73 @@ def measure_window1(
         RMS amplitude in the measurement window.
     window_data : np.ndarray
         Raw voltage samples from the measurement window (for FFT/spectrogram).
+    win_start_idx : int
+        Sample index where the measurement window starts.
+    win_end_idx : int
+        Sample index where the measurement window ends.
     """
     arr = np.array(voltages, dtype=np.float64)
     n = len(arr)
     if n < 100:
-        return 0.0, np.array([])
+        return 0.0, np.array([]), 0, 0
 
     dt_us = 1e6 / sample_rate  # µs per sample
 
-    # Step 1: Compute envelope (RMS over a small sliding window) to find burst.
-    env_win = max(4, int(2 / dt_us))  # ~2 µs sliding window
+    # ---- Step 1: Compute envelope (RMS over sliding window) ----------------
+    env_win_samples = max(8, int(5 / dt_us))  # ~5 µs sliding window
+    half_env = env_win_samples // 2
     envelope = np.zeros(n)
     for i in range(n):
-        lo = max(0, i - env_win // 2)
-        hi = min(n, i + env_win // 2)
+        lo = max(0, i - half_env)
+        hi = min(n, i + half_env)
         envelope[i] = np.sqrt(np.mean(np.square(arr[lo:hi])))
 
-    # Step 2: Find the burst peak.
+    # ---- Step 2: Find burst PEAK (most stable feature) ---------------------
     peak_idx = int(np.argmax(envelope))
     peak_val = float(envelope[peak_idx])
 
-    noise_floor = float(np.percentile(envelope, 20))
-    burst_threshold = max(noise_floor * 3, peak_val * 0.10)
+    if peak_val < 1e-6:
+        # No signal detected
+        win_len = max(10, int(WINDOW1_DUR_US / dt_us))
+        return 0.0, np.zeros(win_len), n // 2, n // 2 + win_len
 
-    # Step 3: Find burst START — scan backward from peak.
-    burst_start_idx = int(peak_idx)
-    while burst_start_idx > 0 and envelope[burst_start_idx - 1] > burst_threshold:
-        burst_start_idx -= 1
+    # ---- Step 3: Calculate burst timing from known frequency ---------------
+    # Period is known exactly from the DDS frequency
+    period_us = 1e6 / excitation_freq_hz
 
-    # Step 4: Estimate period from zero crossings in burst region.
-    burst_region_end = min(n, burst_start_idx + int(200 / dt_us))
-    crossings = []
-    for i in range(burst_start_idx + 1, burst_region_end):
-        if arr[i - 1] <= 0 and arr[i] > 0:
-            crossings.append(i)
+    # For a burst_cycles burst, the burst duration is exactly:
+    burst_duration_us = burst_cycles * period_us
 
-    if len(crossings) >= 2:
-        estimated_period_us = float(np.mean(np.diff(crossings)) * dt_us)
-    else:
-        burst_end_idx_alt = int(peak_idx)
-        while burst_end_idx_alt < n - 1 and envelope[burst_end_idx_alt + 1] > burst_threshold:
-            burst_end_idx_alt += 1
-        estimated_period_us = (burst_end_idx_alt - burst_start_idx) * dt_us / max(burst_cycles, 1)
+    # The peak of the envelope should be approximately in the center of the burst.
+    # So: burst_start = peak - (burst_cycles / 2) * period
+    #     burst_end   = burst_start + burst_duration
+    half_burst_us = burst_duration_us / 2.0
+    burst_center_us = peak_idx * dt_us
+    burst_start_us = burst_center_us - half_burst_us
+    burst_end_us = burst_start_us + burst_duration_us
 
-    # Burst end = burst start + burst_cycles * period
-    burst_end_idx = burst_start_idx + int(burst_cycles * estimated_period_us / dt_us)
-    burst_end_idx = min(burst_end_idx, n - 1)
+    burst_end_idx = int(burst_end_us / dt_us)
 
-    # Step 5: Skip N positive-going zero crossings after burst end.
-    skip_start = burst_end_idx + 1
-    skip_limit = min(n, skip_start + int(500 / dt_us))  # search up to 500 µs
-    skip_count = 0
-    window_start_idx = skip_limit  # default: end of search range
-    for i in range(skip_start + 1, skip_limit):
-        if arr[i - 1] <= 0 and arr[i] > 0:
-            skip_count += 1
-            if skip_count >= skip_zero_crossings:
-                window_start_idx = i
-                break
+    # ---- Step 4: Place measurement window after burst + gap ----------------
+    # Gap of ~1 period ensures we're past any ringing/settling from the burst
+    gap_us = max(5.0, period_us * 0.8)
+    window_start_us = burst_end_us + gap_us
+    window_start_idx = int(window_start_us / dt_us)
 
-    # Step 6: Extract measurement window.
+    # Bounds checking
     win_len = max(10, int(WINDOW1_DUR_US / dt_us))
+    if window_start_idx + win_len > n:
+        window_start_idx = max(0, n - win_len)
+    if window_start_idx < 0:
+        window_start_idx = 0
+
     win_end_idx = min(n, window_start_idx + win_len)
-    window_start_idx = max(0, min(window_start_idx, n - 1))
     win_end_idx = max(window_start_idx + 1, win_end_idx)
 
     window_data = arr[window_start_idx:win_end_idx]
     rms = calc_rms(window_data)
 
-    # Debug on first capture
-    global _debug_printed
-    if not _debug_printed:
-        _debug_printed = True
-        t_bstart = burst_start_idx * dt_us - x_origin_s * 1e6
-        t_bend = burst_end_idx * dt_us - x_origin_s * 1e6
-        t_wstart = window_start_idx * dt_us - x_origin_s * 1e6
-        t_wend = win_end_idx * dt_us - x_origin_s * 1e6
-        print(f"\n  [debug] Peak envelope = {peak_val:.4f} V at sample {peak_idx}")
-        print(f"  [debug] Zero crossings in burst: {len(crossings)}, "
-              f"estimated period = {estimated_period_us:.2f} µs")
-        print(f"  [debug] Burst: sample {burst_start_idx}–{burst_end_idx} "
-              f"(t_rel = {t_bstart:.1f}–{t_bend:.1f} µs)")
-        print(f"  [debug] Skipped {skip_count} zero crossings after burst end")
-        print(f"  [debug] Window 1: samples {window_start_idx}–{win_end_idx} "
-              f"({len(window_data)} pts, t_rel = {t_wstart:.1f}–{t_wend:.1f} µs)")
-
-    return rms, window_data
+    return rms, window_data, window_start_idx, win_end_idx
 
 
 _debug_printed = False
@@ -244,7 +225,8 @@ def main() -> None:
 
         rms_values: list[float] = []
         response_spectra: list[tuple[float, np.ndarray, np.ndarray]] = []  # (exc_freq, fft_freqs, magnitude)
-        all_buffers: list[tuple[float, np.ndarray]] = []  # (exc_freq, full_voltages)
+        # Store: (freq, voltages, sample_rate, win_start_idx, win_end_idx)
+        all_buffers: list[tuple[float, np.ndarray, float, int, int]] = []
         t_start = time.time()
 
         # -- Sweep loop ----------------------------------------------------
@@ -281,14 +263,14 @@ def main() -> None:
             effective_sr = 1.0 / x_increment_s if x_increment_s > 0 else sample_rate
 
             # Measure RMS and extract response window data
-            rms, window_data = measure_window1(
+            rms, window_data, win_start, win_end = measure_window1(
                 voltages, effective_sr, x_origin_s, BURST_CYCLES,
-                skip_zero_crossings=2,
+                excitation_freq_hz=freq,
             )
             rms_values.append(rms)
 
-            # Store full buffer for waveform viewer
-            all_buffers.append((freq, np.array(voltages), effective_sr))
+            # Store full buffer for waveform viewer with window indices
+            all_buffers.append((freq, np.array(voltages), effective_sr, win_start, win_end))
 
             # Compute spectrum of the response window for spectrogram
             if len(window_data) > 0:
@@ -353,11 +335,24 @@ def main() -> None:
         else:
             intensity_db = np.zeros_like(intensity) - 60
 
+        # -- Extract dominant frequencies from spectra ---------------------
+        # For each excitation frequency, find the strongest response frequency
+        dom_freq1_khz = np.zeros(n_steps)
+
+        for j, (exc_freq, fft_freqs, magnitude) in enumerate(response_spectra):
+            if len(fft_freqs) < 3:
+                dom_freq1_khz[j] = np.nan
+                continue
+            # Find index of the largest peak (skip DC at index 0)
+            top1 = np.argmax(magnitude[1:]) + 1
+            dom_freq1_khz[j] = fft_freqs[top1] / 1000
+
         # -- Plot: RMS + Spectrogram + Waveform Viewer ---------------------
         fig = plt.figure(figsize=(10, 10))
         gs = fig.add_gridspec(3, 1, height_ratios=[1, 1.5, 1.5], hspace=0.35)
 
         ax1 = fig.add_subplot(gs[0])
+        ax1r = ax1.twinx()  # secondary y-axis for dominant frequencies
         ax2 = fig.add_subplot(gs[1])
         ax3 = fig.add_subplot(gs[2])
 
@@ -366,16 +361,32 @@ def main() -> None:
             f"{BURST_CYCLES} cycle burst, {freqs[0]/1000:.0f}–{freqs[-1]/1000:.0f} kHz"
         )
 
-        # Top: RMS amplitude vs excitation frequency
-        (rms_line,) = ax1.plot(freqs_arr, rms_arr, linewidth=1.2, color="cyan", marker=".", markersize=3)
+        # Top: RMS amplitude + dominant frequencies on secondary axis
+        (rms_line,) = ax1.plot(freqs_arr, rms_arr, linewidth=1.2, color="cyan",
+                               marker=".", markersize=3, label="RMS Response")
         rms_peak_vline = ax1.axvline(freqs_arr[max_idx], color="gray", linewidth=0.5,
                                      linestyle="--")
         # Slider indicator on RMS plot
-        (slider_vline,) = ax1.plot([freqs_arr[0], freqs_arr[0]], [0, np.max(rms_arr) * 1.1],
+        (slider_vline,) = ax1.plot([freqs_arr[0], freqs_arr[0]],
+                                   [0, np.max(rms_arr) * 1.1],
                                    color="red", linewidth=1.5, linestyle="-", alpha=0.7)
+
+        (dom1_line,) = ax1r.plot(freqs_arr, dom_freq1_khz, linewidth=1.0,
+                                 color="orange", marker="x", markersize=4,
+                                 alpha=0.9, label="Dominant Freq")
+
         ax1.set_ylabel("RMS Amplitude (V)")
+        ax1.set_xlabel("Excitation Frequency (kHz)")
         ax1.grid(True, alpha=0.3)
-        ax1.legend([rms_line], ["RMS Response"], fontsize=8)
+
+        ydom_max = np.nanmax(dom_freq1_khz)
+        if np.isfinite(ydom_max) and ydom_max > 0:
+            ax1r.set_ylim(0, ydom_max * 1.2)
+        ax1r.set_ylabel("Dominant Response Freq (kHz)")
+
+        lines1, labels1 = ax1.get_legend_handles_labels()
+        lines2, labels2 = ax1r.get_legend_handles_labels()
+        ax1.legend(lines1 + lines2, labels1 + labels2, fontsize=8, loc="upper right")
 
         # Middle: Spectrogram
         im = ax2.pcolormesh(
@@ -386,17 +397,32 @@ def main() -> None:
         ax2.set_title("Response Spectrum (dB, relative)")
         fig.colorbar(im, ax=ax2, label="Intensity (dB)")
 
-        # Bottom: Waveform viewer (initially shows first frequency)
-        init_freq, init_buf, init_sr = all_buffers[0]
+        # Bottom: Waveform viewer with window markers
+        init_freq, init_buf, init_sr, init_ws, init_we = all_buffers[0]
         init_sr = float(init_sr) if init_sr > 0 else 12.5e6
         init_dt_us = 1e6 / init_sr
         init_time_us = np.arange(len(init_buf)) * init_dt_us
-        (wave_line,) = ax3.plot(init_time_us, init_buf, linewidth=1.5, color="black")
-        wave_title = ax3.set_title(f"Waveform @ {init_freq/1000:.1f} kHz  |  {len(init_buf)} samples  |  {init_sr/1e6:.1f} MSa/s")
+        (wave_line,) = ax3.plot(init_time_us, init_buf, linewidth=0.8, color="black")
+
+        # Vertical lines marking the measurement window
+        win_vline1 = ax3.axvline(init_ws * init_dt_us, color="lime",
+                                 linewidth=1.5, linestyle="-", alpha=0.7,
+                                 label="Window Start")
+        win_vline2 = ax3.axvline(init_we * init_dt_us, color="yellow",
+                                 linewidth=1.5, linestyle="-", alpha=0.7,
+                                 label="Window End")
+        # Shaded region for the window
+        win_fill = ax3.axvspan(init_ws * init_dt_us, init_we * init_dt_us,
+                               alpha=0.08, color="lime")
+        wave_title = ax3.set_title(
+            f"Waveform @ {init_freq/1000:.1f} kHz  |  "
+            f"{len(init_buf)} samples  |  {init_sr/1e6:.1f} MSa/s")
         ax3.set_xlabel("Time (µs)")
         ax3.set_ylabel("Voltage (V)")
+        ax3.set_ylim(-2.0, 2.0)
         ax3.grid(True, alpha=0.3)
         ax3.set_xlim(0, init_time_us[-1])
+        ax3.legend(fontsize=8)
 
         # Slider at the bottom
         slider_ax = fig.add_axes([0.15, 0.02, 0.7, 0.03])
@@ -419,13 +445,21 @@ def main() -> None:
             idx = freq_to_idx.get(sel_freq_hz)
             if idx is None:
                 return
-            _, buf, sr = all_buffers[idx]
+            _, buf, sr, ws, we = all_buffers[idx]
             sr = float(sr) if sr > 0 else 12.5e6
             dt_us = 1e6 / sr
             time_us = np.arange(len(buf)) * dt_us
 
             wave_line.set_data(time_us, buf)
             ax3.set_xlim(0, time_us[-1])
+
+            # Update window markers
+            win_vline1.set_xdata([ws * dt_us, ws * dt_us])
+            win_vline2.set_xdata([we * dt_us, we * dt_us])
+            # Update shaded region (Rectangle patch from axvspan)
+            win_fill.set_xy((ws * dt_us, -2.0))
+            win_fill.set_width((we - ws) * dt_us)
+            win_fill.set_height(4.0)
 
             # Update slider indicator on RMS plot
             slider_vline.set_xdata([sel_freq_khz, sel_freq_khz])
