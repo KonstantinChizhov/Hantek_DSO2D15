@@ -27,15 +27,15 @@ RESOURCE = None          # None -> auto-discover
 CHANNEL = 1
 DISABLE_CH2 = True
 
-FREQ_START_HZ = 40_000
-FREQ_STOP_HZ = 200_000
-FREQ_STEP_HZ = 2_000
+FREQ_START_HZ = 20_000
+FREQ_STOP_HZ = 250_000
+FREQ_STEP_HZ = 1_000
 
 DDS_AMP_VPP = 2.0        # DDS output amplitude (fixed)
 DDS_OFFSET_V = 0.0
 
 V_DIV = 0.5              # Scope vertical scale
-TIME_DIV_S = 50e-6       # Timebase — enough cycles at each frequency
+TIME_DIV_S = 20e-6       # Timebase — enough cycles at each frequency
 TRIGGER_LEVEL_V = 0.0
 SETTLE_S = 0.1           # Wait after frequency change before capture
 ACQ_POINTS = 4000        # Fixed depth to avoid fragmented packet artifacts
@@ -118,7 +118,10 @@ def main() -> None:
             # Capture one fresh single-shot record per frequency point.
             voltages, _, _ = scope.capture_single_waveform(
                 channel=CHANNEL,
-                timeout_s=max(1.0, SETTLE_S + 0.5),
+                timeout_s=1.0,
+                retries=1,
+                read_retries_per_capture=1,
+                read_timeout_ms=3000,
             )
 
             # Measure

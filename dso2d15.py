@@ -207,6 +207,37 @@ class DSO2D15:
         return float(self._query(":DDS:FREQ?"))
 
     # ------------------------------------------------------------------
+    # DDS Burst commands
+    # ------------------------------------------------------------------
+    def set_burst_cycle_count(self, count: int) -> None:
+        """Set the number of cycles per burst."""
+        self._write(f":DDS:BURSt:CNT {int(count)}")
+
+    def get_burst_cycle_count(self) -> int:
+        """Query the current burst cycle count."""
+        return int(self._query(":DDS:BURSt:CNT?"))
+
+    def set_burst_type(self, burst_type: str) -> None:
+        """Set burst type: NORM (finite), INF (infinite), or GATE (gated)."""
+        self._write(f":DDS:BURSt:TYPE {burst_type}")
+
+    def get_burst_type(self) -> str:
+        """Query the current burst type."""
+        return self._query(":DDS:BURSt:TYPE?")
+
+    def trigger_burst(self) -> None:
+        """Fire a single software-triggered burst."""
+        self._write(":DDS:BURSt:TRIGger")
+
+    def enable_burst_mode(self, enabled: bool = True) -> None:
+        """Enable or disable DDS burst mode."""
+        self._write(f":DDS:BURSt:SWITch {'ON' if enabled else 'OFF'}")
+
+    def get_burst_mode_state(self) -> str:
+        """Query DDS burst mode state."""
+        return self._query(":DDS:BURSt:SWITch?")
+
+    # ------------------------------------------------------------------
     # Channel commands
     # ------------------------------------------------------------------
     def set_channel_scale(self, channel: int, volts_per_div: float) -> None:
@@ -297,6 +328,18 @@ class DSO2D15:
         """Query current acquisition sampling rate in Sa/s."""
         return float(self._query(":ACQuire:SRATe?"))
 
+    def get_waveform_x_origin(self) -> float:
+        """Query the time offset (seconds) of the first sample relative to trigger.
+
+        Returns a negative value when pre-trigger data is present in the buffer.
+        A value of 0 means the trigger is at sample index 0.
+        """
+        return float(self._query(":WAVeform:XORigin?"))
+
+    def get_waveform_x_increment(self) -> float:
+        """Query the time interval (seconds) between consecutive samples."""
+        return float(self._query(":WAVeform:XINCrement?"))
+
     def set_acquisition_state(self, running: bool) -> None:
         """Explicitly set acquisition state without relying on front-panel toggle logic."""
         self._write(f":ACQuire:STATE {'ON' if running else 'OFF'}")
@@ -307,7 +350,7 @@ class DSO2D15:
             return
         try:
             old_timeout = self._inst.timeout
-            self._inst.timeout = 100
+            self._inst.timeout = 20
             while True:
                 self._inst.read_raw()
         except Exception:
@@ -320,10 +363,10 @@ class DSO2D15:
         self,
         channel: int = 1,
         timeout_s: float = 2.0,
-        retries: int = 2,
+        retries: int = 1,
         min_samples: int = 1000,
-        read_retries_per_capture: int = 2,
-        read_timeout_ms: int = 5000,
+        read_retries_per_capture: int = 1,
+        read_timeout_ms: int = 3000,
     ) -> Tuple[List[float], float, float]:
         """
         Capture and read one fresh waveform record.
@@ -343,7 +386,7 @@ class DSO2D15:
             #   1) select single trigger sweep
             #   2) force one trigger to ensure capture from STOP state
             self.set_trigger_sweep("SINGle")
-            time.sleep(0.03)
+            time.sleep(0.01)
             self.force_trigger()
 
             done = self.wait_acquisition_done(timeout_s=timeout_s)
@@ -383,6 +426,68 @@ class DSO2D15:
         raise RuntimeError(
             f"Failed to capture non-empty waveform after {max(1, retries)} acquisition "
             f"attempt(s) and {max(1, read_retries_per_capture)} read retry(ies) each."
+        ) from last_error
+
+    def capture_triggered_waveform(
+        self,
+        channel: int = 1,
+        timeout_s: float = 2.0,
+        retries: int = 2,
+        min_samples: int = 100,
+        read_retries_per_capture: int = 2,
+        read_timeout_ms: int = 5000,
+    ) -> Tuple[List[float], float, float]:
+        """
+        Arm a single-shot capture and wait for an **external trigger** (e.g. DDS burst).
+
+        Unlike :meth:`capture_single_waveform`, this does **not** call
+        ``:TRIGger:FORCe`` — it arms the scope in single-shot mode and waits
+        for an incoming trigger event from the signal itself.
+
+        Typical usage for burst capture::
+
+            scope.set_trigger_sweep("SINGle")   # arm single-shot
+            scope.trigger_burst()               # fire the burst
+            voltages, sr, _ = scope.capture_triggered_waveform()
+        """
+        assert self._inst is not None, "Not connected."
+
+        last_error: Optional[Exception] = None
+        for attempt in range(1, max(1, retries) + 1):
+            done = self.wait_acquisition_done(timeout_s=timeout_s)
+            if not done:
+                warnings.warn(
+                    f"Triggered acquisition did not complete within {timeout_s:.2f}s; "
+                    "reading last available waveform record.",
+                    RuntimeWarning,
+                )
+
+            for read_try in range(1, max(1, read_retries_per_capture) + 1):
+                try:
+                    voltages, y_inc, y_org = self.read_waveform(
+                        channel=channel,
+                        read_timeout_ms=read_timeout_ms,
+                    )
+                    if len(voltages) >= max(1, min_samples):
+                        return voltages, y_inc, y_org
+                    raise ValueError(
+                        f"Waveform payload too short: {len(voltages)} samples "
+                        f"(expected >= {max(1, min_samples)})."
+                    )
+                except Exception as exc:
+                    last_error = exc
+                    if read_try < max(1, read_retries_per_capture):
+                        time.sleep(0.05)
+                        continue
+
+            if attempt < max(1, retries):
+                self.clear_buffer()
+                time.sleep(0.05)
+                continue
+            break
+
+        raise RuntimeError(
+            f"Failed to capture non-empty waveform after {max(1, retries)} attempt(s)."
         ) from last_error
 
     def read_waveform(

@@ -62,14 +62,20 @@ def main() -> None:
         scope.set_wave_amplitude(WAVE_AMP_VPP)
         time.sleep(0.3)
         scope.enable_wave_output(True)
-        time.sleep(1.0)  # Let DDS hardware stabilize
+        time.sleep(0.5)  # Let DDS hardware stabilize
 
         # -- 3. Acquire ----------------------------------------------------
         print("Acquiring one fresh single-shot record …")
 
         # -- 4. Read & plot ------------------------------------------------
         print("Reading waveform …")
-        voltages, _, _ = scope.capture_single_waveform(channel=CHANNEL, timeout_s=2.0)
+        voltages, _, _ = scope.capture_single_waveform(
+            channel=CHANNEL,
+            timeout_s=1.2,
+            retries=1,
+            read_retries_per_capture=1,
+            read_timeout_ms=3000,
+        )
         print(f"  {len(voltages)} samples, {min(voltages):.3f} V to {max(voltages):.3f} V")
 
         num_samples = len(voltages)
