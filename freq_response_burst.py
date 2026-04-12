@@ -45,8 +45,8 @@ BURST_CYCLES = 2         # Number of cycles per burst (1-3 recommended)
 DDS_AMP_VPP = 5.0        # DDS output amplitude (Vpp)
 DDS_OFFSET_V = 0.0
 
-V_DIV = 0.5              # Scope vertical scale
-TRIGGER_LEVEL_V = 0.1    # Trigger threshold to catch burst edge
+V_DIV = 0.1              # Scope vertical scale
+TRIGGER_DIV = 0.3        # Trigger level in divisions (0.3 div ≈ 15% of full range)
 ACQ_POINTS = 4000        # Memory depth per capture
 
 # RMS measurement window (after burst end + 2 zero crossings)
@@ -204,9 +204,11 @@ def main() -> None:
         scope.set_acquisition_points(ACQ_POINTS)
 
         # Edge trigger on the burst rising edge, normal sweep
+        trigger_level_v = TRIGGER_DIV * V_DIV
         scope.set_trigger_edge_source(CHANNEL)
-        scope.set_trigger_level(TRIGGER_LEVEL_V)
+        scope.set_trigger_level(trigger_level_v)
         scope.set_trigger_sweep("NORMal")
+        print(f"Trigger level: {trigger_level_v:.3f} V ({TRIGGER_DIV} div)")
 
         # -- DDS burst setup (done once) -----------------------------------
         print("Initializing DDS burst mode …")
@@ -248,24 +250,40 @@ def main() -> None:
             scope.set_wave_frequency(freq)
             time.sleep(SETTLE_S)
 
-            # Drain any pending replies before starting fresh
-            scope.clear_buffer()
+            # 3) Capture with retry — blank captures happen when the scope isn't
+            #    fully armed before the burst fires. Retry if no signal detected.
+            MAX_CAPTURE_RETRIES = 3
+            voltages = []
+            sample_rate = 12.5e6
+            for attempt in range(MAX_CAPTURE_RETRIES):
+                # Drain any pending replies once before arming
+                if attempt == 0:
+                    scope.clear_buffer()
 
-            # 1) Arm the scope in single-shot mode (scope waits for trigger)
-            scope.set_trigger_sweep("SINGle")
-            time.sleep(0.01)
+                # 1) Arm the scope in single-shot mode (scope waits for trigger)
+                scope.set_trigger_sweep("SINGle")
+                time.sleep(0.05)  # longer delay — scope needs time to fully arm
 
-            # 2) Fire one burst — this is what the scope triggers on
-            scope.trigger_burst()
+                # 2) Fire one burst — this is what the scope triggers on
+                scope.trigger_burst()
 
-            # 3) Wait for the scope to capture the burst (no force trigger)
-            voltages, sample_rate, _ = scope.capture_triggered_waveform(
-                channel=CHANNEL,
-                timeout_s=2.0,
-                retries=2,
-                read_retries_per_capture=2,
-                read_timeout_ms=5000,
-            )
+                # 3) Wait for the scope to capture the burst
+                voltages, sample_rate, _ = scope.capture_triggered_waveform(
+                    channel=CHANNEL,
+                    timeout_s=2.0,
+                    retries=2,
+                    read_retries_per_capture=2,
+                    read_timeout_ms=5000,
+                )
+
+                # Quick validation: check if burst is present
+                arr = np.array(voltages, dtype=np.float64)
+                signal_range = np.max(arr) - np.min(arr)
+                if signal_range > 0.05:  # At least 50 mV peak-to-peak
+                    break  # Good capture, proceed
+
+                # Blank capture — retry after a short delay
+                time.sleep(0.1)
 
             # Query timing info
             x_origin_s = scope.get_waveform_x_origin()
